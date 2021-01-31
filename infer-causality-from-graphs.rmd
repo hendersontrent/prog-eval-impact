@@ -1,0 +1,405 @@
+---
+title: "Identifying impact in program evaluation when you cannot infer causality"
+author: "Trent Henderson"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    highlight: pygments
+    fig_width: 7
+    fig_height: 4
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+Welcome! In this tutorial we are going to explore an important topic - impact and causal inference. Specifically, we are going to simulate some data that is indicative of what you might see on a consulting program evaluation project, and quantitatively examine: 
+
+* Why you might be tempted (just from looking at graphs) to infer that the program has caused some change
+* Why you should not trust your eyes
+* Why you need to perform statistical analysis to test what your eyes see
+
+In this tutorial, we are going to see what useful things we can do with a single dataset which contains only one univariate time series of values. This is very different to the multivariate situations we encounter in the real world, where we build in control variables, partition variance, and perform other statistical operations to enhance our ability to make causal inferences. While it is generally not recommended to make causal inferences (outside experimental settings) without at least controlling for extraneous factors, sometimes in consulting clients either do not have more data or you do not have any time to collect more from other sources. While under these circumstances we definitely should not say that the introduction of a given program *caused* a change, with the appropriate application of statistics we can still make much more informed and quantified statements than if we just assumed causality after eyeballing a graph and calculating something nonsensical such as a percentage change or compound annual growth rate (CAGR).
+
+## Premise
+
+You are a consultant whose firm has been hired to conduct a program evaluation. Your role as the analyst on the evaluation is to determine (and visualise) the extent to which the introduction of a homelessness program has impacted the number of homeless people in a given region. You might have the following hypothesis:
+
+* After the introduction of the program, the number of homeless people will decrease
+
+Clearly, from the structure of the hypothesis, you are (purposefully or not) inferring a *causal effect* of program introduction on a quantitative outcome. Exploring causality (and all data analysis) rigorously and properly is important for several reasons:
+
+1. Inappropriate or incorrect analysis/inference can be potentially damaging to your client and those who fund the program - your results may mislead their understanding of program impact
+2. Inappropriate or incorrect analysis/inference can be potentially damaging to those who receive the service you are evaluating
+3. Inappropriate or incorrect analysis/inference can potentially damage the reputation of you/your firm as trustworthy analysts
+
+Given the lack of data and control variables, we will not be able to directly infer causality in this example. Instead, if we find an effect that aligns with our hypothesised change period, we could use cautious wording describing that there has been an impact, but it is unclear what the underlying causal process is. But just because we cannot make the philosophical causal leap, quantifying that change or impact is still very important and may be used in future analysis in a causal argument.
+
+Let us take a look at this further with some code. We are going to be using the statistical programming language `R`. If you do not have R on your system, you can download it [here](https://www.r-project.org/). It is also recommended to write R in the Integrated Development Environment (IDE) called [RStudio](https://rstudio.com/products/rstudio/) - a software interface designed specifically to write R, view plots, and manage an environment of dataframes and values that you load/produce.
+
+## Setting up your R session
+
+First, let us load the `R` packages we need to run the tutorial code:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE}
+library(dplyr) # For data manipulation
+library(magrittr) # For the '%>%' pipe operator
+library(ggplot2) # For producing plots
+library(scales) # For making plot axes pretty
+library(tscount) # For simulating time series count data
+library(mgcv) # For fitting generalised additive models
+library(CausalImpact) # For fitting Byesian structural time series models for causal inference
+library(changepoint) # For fitting changepoint models
+library(bcp) # For fitting Bayesian changepoint models
+```
+
+# Data simulation
+
+Before we can do any analysis or visualisation, we first need some data. For this tutorial we are going to simulate some to make the entire session easily reproducible. Feel free to just run this chunk of code so you have the data - the simulation itself is not the focus of this tutorial.
+
+For those curious, since our outcome of interest is *number of homeless people* - which is obviously a non-zero integer - we are going to simulate data from a [Poisson distribution](https://en.wikipedia.org/wiki/Poisson_distribution). We are just going to analyse a simple univariate example in this tutorial.
+
+```{r, warning = FALSE, message = FALSE, error = FALSE}
+#' Function to simulate indicative program evaluation data
+#' @param t the number of timepoints to simulate
+#' @return a dataframe with 2 columns [t,y] - where t = timepoint, y = response variable value
+#' @author Trent Henderson
+#'
+
+simulation_engine <- function(t = 180){
+
+    if(!is.numeric(t)){
+        stop("t should be a single integer number specifying the number of timepoints to simulate.")
+    }
+  
+    # Fix R's seed to ensure reproducibility
+  
+    set.seed(123)
+
+    # Run simulation
+
+    sim <- tsglm.sim(t, param = list(intercept = 7, past_obs = NULL, past_mean = NULL,
+                            xreg = NULL), link = c("log"), distr = c("poisson"), n_start = 50)
+
+    # Convert to a dataframe
+
+    ts_dat <- data.frame(t = c(1:t),
+                    y = sim$ts)
+
+    # Create a reusable value of where the program was introduced
+
+    t_change <- as.integer(0.6*t)
+
+    # Apply a linear trend component from the t_change cutpoint to give the visual look of a causal change
+
+    ts <- ts_dat %>%
+        mutate(y = ifelse(t >= t_change, (0.97*y), y),
+        y = as.integer(y))
+
+    return(ts)
+}
+
+# Run the function
+
+ts <- simulation_engine(t = 180)
+```
+
+# Data visualisation
+
+As with almost all data projects, it is usually useful to start out by visualising the data. This helps you get a sense of the likely distribution of your key variables and potential relationships between them to expect.
+
+## Time series plots
+
+With time series data, we often start by plotting the raw time series with time on the `x` axis and our response variable value on the `y` axis. The below code does this for us. If you are new to R, do not be put off by the amount of plotting code - most of it is just *prettying* it up and making it look visually appealing. The *core* plotting parts are mostly just the `ggplot()` and `geom_` lines.
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+# Create a reusable value of where the program was introduced
+
+t_change <- as.integer(0.6*nrow(ts))
+
+# Draw plot
+
+ts %>%
+  mutate(indicator = ifelse(t < t_change, "Pre-program introduction", "Post-program introduction")) %>% # Binary variable for whether a datapoint is pre-program introduction
+  mutate(indicator = factor(indicator, levels = c("Pre-program introduction", "Post-program introduction"))) %>% # Makes sure our legend is in chronological order
+  ggplot(aes(x = t, y = y)) +
+  annotate(geom = "rect", xmin = t_change, xmax = max(ts$t), ymax = Inf, ymin = -Inf,
+           fill = "#ececec", alpha = 0.6) + # Visual reference for when program was introduced
+  geom_line(aes(colour = indicator), size = 1.25) +
+  labs(title = "Raw time series plot",
+       x = "Time",
+       y = "Number of homeless people",
+       colour = "Cutpoint") +
+  scale_y_continuous(labels = comma) +
+  scale_colour_manual(values = c("#88C9FA", "#F353D5")) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank())
+```
+
+This is useful, but the up-down nature of the line makes it difficult to see any difference in trends. We can apply some *smoothing* using a [generalised linear model](https://en.wikipedia.org/wiki/Generalized_linear_model) (more on these later) and re-plot. *Note that the shading here indicates the 95% confidence interval, and the line indicates the mean.*
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+ts %>%
+  ggplot(aes(x = t, y = y)) +
+  annotate(geom = "rect", xmin = t_change, xmax = max(ts$t), ymax = Inf, ymin = -Inf,
+           fill = "#ececec", alpha = 0.6) +
+  geom_point(colour = "#BDC3CB", alpha = 0.4) +
+  geom_smooth(formula = y ~ x, method = "glm",
+              colour = "#88C9FA", fill = "#88C9FA", size = 1.25, 
+              method.args = list(family = "poisson")) +
+  labs(title = "Smoothed time series plot",
+       x = "Time",
+       y = "Number of homeless people") +
+  scale_y_continuous(labels = comma) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+```
+
+Going one step further, we can fit a separate regression for the pre and post periods. For the econometrically-minded, this might remind you of [regression discontinuity designs](https://en.wikipedia.org/wiki/Regression_discontinuity_design).
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+ts %>%
+  mutate(indicator = ifelse(t < t_change, "Pre-program introduction", "Post-program introduction")) %>%
+  mutate(indicator = factor(indicator, levels = c("Pre-program introduction", "Post-program introduction"))) %>%
+  ggplot(aes(x = t, y = y)) +
+  annotate(geom = "rect", xmin = t_change, xmax = max(ts$t), ymax = Inf, ymin = -Inf,
+           fill = "#ececec", alpha = 0.6) +
+  geom_point(colour = "#BDC3CB", alpha = 0.4) +
+  geom_smooth(formula = y ~ x, method = "glm",
+              aes(colour = indicator, fill = indicator), size = 1.25, 
+              method.args = list(family = "poisson")) +
+  labs(title = "Smoothed time series plot",
+       x = "Time",
+       y = "Number of homeless people") +
+  scale_y_continuous(labels = comma) +
+  scale_colour_manual(values = c("#88C9FA", "#F353D5")) +
+  scale_fill_manual(values = c("#88C9FA", "#F353D5")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank())
+```
+
+We can also aggregate our data as annual sums instead of monthly datapoints to smooth it out even further:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+# Generate some years to add to the main data to aggregate over
+
+annual <- ts %>%
+  mutate(year = case_when(
+    t <= 1*12              ~ 2006,
+    t > 1*12 & t <= 2*12   ~ 2007,
+    t > 2*12 & t <= 3*12   ~ 2008,
+    t > 3*12 & t <= 4*12   ~ 2009,
+    t > 4*12 & t <= 5*12   ~ 2010,
+    t > 5*12 & t <= 6*12   ~ 2011,
+    t > 6*12 & t <= 7*12   ~ 2012,
+    t > 7*12 & t <= 8*12   ~ 2013,
+    t > 8*12 & t <= 9*12   ~ 2014,
+    t > 9*12 & t <= 10*12  ~ 2015,
+    t > 10*12 & t <= 11*12 ~ 2016,
+    t > 11*12 & t <= 12*12 ~ 2017,
+    t > 12*12 & t <= 13*12 ~ 2018,
+    t > 13*12 & t <= 14*12 ~ 2019,
+    t > 14*12              ~ 2020)) %>%
+  mutate(indicator = ifelse(year < 2014, "Pre-program introduction", "Post-program introduction")) %>%
+  mutate(indicator = factor(indicator, levels = c("Pre-program introduction", "Post-program introduction"))) %>%
+  group_by(year, indicator) %>%
+  summarise(y = sum(y)) %>%
+  ungroup()
+
+# Draw plot
+
+annual %>%
+  ggplot(aes(x = year, y = y)) +
+  annotate(geom = "rect", xmin = 2014, xmax = 2020, ymax = Inf, ymin = -Inf,
+           fill = "#ececec", alpha = 0.6) +
+  geom_line(aes(colour = indicator), size = 1.25) +
+  labs(title = "Annual aggregation",
+       x = "Year",
+       y = "Number of homeless people",
+       colour = "Cutpoint") +
+  scale_x_continuous(breaks = seq(from = 2006, to = 2020, by = 1)) +
+  scale_y_continuous(labels = comma) +
+  scale_colour_manual(values = c("#88C9FA", "#F353D5")) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank())
+```
+
+And applying the GLM regression to it:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+annual %>%
+  ggplot(aes(x = year, y = y)) +
+  annotate(geom = "rect", xmin = 2014, xmax = 2020, ymax = Inf, ymin = -Inf,
+           fill = "#ececec", alpha = 0.6) +
+  geom_point(colour = "#BDC3CB", alpha = 0.6) +
+  geom_smooth(formula = y ~ x, method = "glm",
+              aes(colour = indicator, fill = indicator), size = 1.25, 
+              method.args = list(family = "poisson")) +
+  labs(title = "Annual aggregation",
+       x = "Year",
+       y = "Number of homeless people",
+       colour = "Cutpoint") +
+  scale_x_continuous(breaks = seq(from = 2006, to = 2020, by = 1)) +
+  scale_y_continuous(labels = comma) +
+  scale_colour_manual(values = c("#88C9FA", "#F353D5")) +
+  scale_fill_manual(values = c("#88C9FA", "#F353D5")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank())
+```
+
+## Distribution plots
+
+As well as the standard time series format, we can visualise the distribution of of variable of interest. A common way of doing this is a density plot:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+ts %>%
+    ggplot(aes(x = y)) +
+    geom_density(fill = "#88C9FA", alpha = 0.8, colour = "black") +
+    scale_x_continuous(labels = comma) +
+    labs(title = "Distribution of response values",
+         x = "Number of homeless people",
+         y = "Density") +
+    theme_bw() +
+    theme(panel.grid.minor = element_blank())
+```
+
+Since we are interested in the differences before and after the introduction of a program, we might also want to produce a density plot for each of these to get a sense of how different the distributions of values are:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+ts %>%
+    mutate(indicator = ifelse(t < t_change, "Pre-program introduction", "Post-program introduction")) %>%
+    mutate(indicator = factor(indicator, levels = c("Pre-program introduction", "Post-program introduction"))) %>%
+    ggplot(aes(x = y)) +
+    geom_density(aes(fill = indicator), alpha = 0.6, colour = "black") +
+    labs(title = "Distribution of response values by cutpoint",
+         x = "Number of homeless people",
+         y = "Density",
+         fill = "Cutpoint") +
+    scale_x_continuous(labels = comma) +
+    scale_fill_manual(values = c("#88C9FA", "#F353D5")) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          panel.grid.minor = element_blank())
+```
+
+## What do our eyes tell us?
+
+At this point, it is awfully tempting to make the mental leap that the introduction of the program has caused a substantial change in our outcome of interest and stop the analysis here. Our visual *evidence* is twofold:
+
+1. The time series graph shows a decrease that aligns with our hypothesised impacts
+2. The distributions are somewhat distinct for pre-program vs post-program introduction
+
+This is the point where things start to get hairy. It is definitely the easier option to stop the analysis now and start writing about program impacts in a report that will go to the client. But a rigorous evaluation requires robust and appropriate analysis, and for anything where you are inferring, especially causal impacts, you **need** to use statistical analysis. Statistics gives you the mathematical tools necessary to specify your assumptions and test for and infer effects
+
+# A proper statistical investigation
+
+Okay, let us dive into the good stuff. As analysts, we have many tools at our disposal to address our hypothesis in this example. Some options you might consider at the start of the project are:
+
+1. Performing an interrupted time series analysis using changepoints
+2. Predicting historical (pre-program) data through to the most recent timepoint you are likely to get data for, and comparing the simulated *counterfactual* data in the post-program introduction period with the *actual* data
+
+Let us take a look at the approach for each.
+
+## Modelling Option A: Interruped time series analysis
+
+[Interrupted time series analysis](https://www.bmj.com/content/350/bmj.h2750) is a quasi-experimental technique that is commonly used by policy analysts to understand the potential impact of a program. At a high level, interrupted time series analysis aims to identify *cutpoints* in the data where there is a shift in some metric (for example mean and variance) and then compare the statistical properties on either side of the cutpoint(s). In R, we have a few options (and packages) for implementing interrupted time series analysis, and we will cover two options here:
+
+1. Changepoint
+2. Bayesian changepoint
+
+### Changepoint
+
+Changepoint analysis is perhaps the most textbook version of an interrupted time series analysis. Changepoint analysis aims to determine the points in time in which our data exhibits sharply different behaviour. Implementation in R is a trivial amount of code:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+# Fit a changepoint model specifying the number of changepoints as 1 (we have no reason to believe otherwise)
+
+fit_cp <- cpt.mean(ts$y, Q = 1)
+
+# Plot the output
+
+plot(fit_cp)
+```
+
+### Bayesian changepoint
+
+Using a very similar approach to the `changepoint` method explored above, we can adopt a Bayesian framework and test for posterior probabilities of changepoint occurrence. Again, the R code to do this is trivial:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+# Fit a Bayesian changepoint model
+
+fit_bcp <- bcp(ts$y)
+
+# Plot the output
+
+plot(fit_bcp)
+```
+
+## Modelling Option B: Synthetic counterfactual
+
+If the above options are not enough evidence, or if you have a penchant for doing things yourself, you can predict the values in the post-program introduction period using data from the pre-program period and compare these predictions to the *actual* values. This is a much more involved process, but can be rewarding and offers the largest amount of flexibility. Modelling is a huge field unto itself, and there are many tools at our disposal. For simplicity, we are just going to cover one option here - using a synthetic counterfactual posterior distribution calculation against the real data.
+
+Bayesian analysis in R is typically done under the hood (or explicitly) by the probabilistic programming language [Stan](https://mc-stan.org/). I love programming in `Stan`, however, teaching you another programming language is not the focus of this tutorial. So, rather than coding up a probabilistic model from scratch, we are going to use an existing package called `CausalImpact` that abstracts away from low-level Bayesian code. This is likely most useful for those of you seeking to implement the conceptual approaches in this tutorial to your own work. I might write a Stan version of this tutorial one day.
+
+[CausalImpact](https://google.github.io/CausalImpact/CausalImpact.html) is an R package for Bayesian analysis of time series data developed by Google. Without delving too much into the underpinnings of Bayesian analysis here, what the package tries to do is model a counterfactual based on pre and post intervention periods that you feed into the model. It then quantifies the magnitude of the potential causal impact. `CausalImpact` is a very useful tool as it produces intuitive plots and a summary report very quickly, if your model is not too complex.
+
+```{r, warning = FALSE, message = FALSE, error = FALSE, fig.keep = TRUE}
+# Set up pre and post periods for the model
+
+pre.period <- c(min(ts$t), t_change-1)
+post.period <- c(t_change, max(ts$t))
+
+# Get our data into the form of j1 = response variable, j2 = timeperiod which CausalImpact needs
+
+tci <- ts %>%
+  dplyr::select(c(y, t))
+
+# Fit a CausalImpact model
+
+impact <- CausalImpact(tci, pre.period, post.period)
+
+# Return the automated plot
+
+plot(impact)
+```
+
+The *cumulative* plot in our case is particularly useful here - it shows the total impact (number of people who are now **not** homeless) by adding the reduction of each consecutive time point to the previous reductions until the end of the prediction period.
+
+We can also access some important model values via a one-liner:
+
+```{r, warning = FALSE, message = FALSE, error = FALSE}
+summary(impact)
+```
+
+# Concluding thoughts
+
+If you made it this far, thank you! I hope you found it informative. In summary, do not use mere graphs as indicators of statistical difference or causality - take the steps to analytically test your hypotheses, specify your prior knowledge and assumptions, and use tools fit for the purpose of inference instead of your eyes. Through this process, you are also able to quantify the distribution of likely impacts.
+
+It is also important to mention that in practice, we would often seek to include many other variables in our modelling, both to account for their effects and to understand their patterns. Many of the examples provided here extend into the multivariate space, but require much more extensive model diagnostics.
+
+Further, when dealing with important questions of inference - particularly causal - it is imperative that you adopt a modelling approach that is approrpiate to the enormity and difficulty of the task you set out to complete. I find that your chances of successful modelling (note: this does not mean finding *significant* p-values, this means conducting accurate and appropriate statistical work) are maximised if you specify your analytical methodology and hypotheses up front before seeing any data. This ensures your analysis process is scientific and not influenced by the confirmation bias of your and others that creeps in so easily on consulting projects where you are tempted to show the client *interesting* or *insightful* things. These facts do not always bode well for organisation-level metrics such as profit margin on projects, but it ensures your analysis is rigorous, defensible, and well-intentioned. That seems worth it in my eyes.
+
+## Contact me
+
+If you have any questions or just want to chat about statistics, please swing me an [email](trent.henderson1@outlook.com) or a [tweet](https://twitter.com/trentlikesstats).
+
+## Additional resources
+
+If this tutorial sparked your interest and has made you want to learn more, below are some excellent resources around this topic.
+
+* [Regression and Other Stories](https://www.cambridge.org/core/books/regression-and-other-stories/DD20DD6C9057118581076E54E40C372C) - Andrew Gelman, Jennifer Hill, Aki Vehtari
+* [Statistical Rethinking](https://www.google.com/search?q=statistical+rethinking&rlz=1C5CHFA_enAU918AU918&oq=statistical+rethinking&aqs=chrome..69i57j46i39j0i395l3j0i20i263i395j0i395l4.3750j1j7&sourceid=chrome&ie=UTF-8) - Richard McElreath
+* [The Elements of Statistical Learning](https://link.springer.com/book/10.1007/978-0-387-84858-7) - Trevor Hastie, Robert Tibshirani, Jerome Friedman
+* [Causal Inference in Statistics: A Primer](http://bayes.cs.ucla.edu/PRIMER/) - Judea Pearl, Madelyn Glymour, Nicholas P. Jewell
+* [The Analysis of Time Series: Theory and Practice](https://www.springer.com/gp/book/9780412141805) - Christopher Chatfield
